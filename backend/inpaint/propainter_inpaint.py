@@ -33,8 +33,19 @@ def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
     masks_img = []
     masks_dilated = []
     flow_masks = []
+    # A list contains one binary mask per frame; a single ndarray is repeated
+    # for every frame for backwards compatibility.
+    if isinstance(mpath, (list, tuple)):
+        for mask in mpath:
+            if not isinstance(mask, np.ndarray):
+                raise TypeError("Frame-wise masks must be numpy arrays")
+            if mask.ndim == 3 and mask.shape[2] == 1:
+                mask = mask.squeeze(2)
+            elif mask.ndim == 3 and mask.shape[2] == 3:
+                mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+            masks_img.append(Image.fromarray(mask))
     # 如果传入的直接为numpy array
-    if isinstance(mpath, np.ndarray):
+    elif isinstance(mpath, np.ndarray):
         if mpath.ndim == 3 and mpath.shape[2] == 1:
             mpath = mpath.squeeze(2)  # 从 (H,W,1) 转为 (H,W)
         elif mpath.ndim == 3 and mpath.shape[2] == 3:
@@ -360,18 +371,49 @@ class PropainterInpaint:
         comp_frames = [cv2.cvtColor(i, cv2.COLOR_RGB2BGR) for i in comp_frames]
         return comp_frames
 
-    def __call__(self, input_frames: List[np.ndarray], input_mask: np.ndarray):
+    def __call__(self, input_frames: List[np.ndarray], input_mask):
         """
         :param input_frames: 原视频帧
-        :param input_mask: 字幕区域mask
+        :param input_mask: 字幕区域mask，或者与输入帧一一对应的mask列表
         """
-        mask = input_mask[:, :, None]
-        H_ori, W_ori = mask.shape[:2]
+        if not input_frames:
+            return []
+
+        if isinstance(input_mask, (list, tuple)):
+            if len(input_mask) != len(input_frames):
+                raise ValueError(
+                    f"Expected one mask per frame ({len(input_frames)}), got {len(input_mask)}"
+                )
+            frame_masks = list(input_mask)
+        else:
+            frame_masks = [input_mask] * len(input_frames)
+
+        normalized_masks = []
+        expected_shape = input_frames[0].shape[:2]
+        for mask in frame_masks:
+            if not isinstance(mask, np.ndarray):
+                raise TypeError("Masks must be numpy arrays")
+            if mask.ndim == 3 and mask.shape[2] == 1:
+                mask = mask[:, :, 0]
+            elif mask.ndim == 3 and mask.shape[2] == 3:
+                mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+            elif mask.ndim != 2:
+                raise ValueError(f"Unsupported mask shape: {mask.shape}")
+            if mask.shape != expected_shape:
+                raise ValueError(
+                    f"Mask shape {mask.shape} does not match frame shape {expected_shape}"
+                )
+            normalized_masks.append(mask)
+
+        # Use the union only to choose stable crop regions for the batch.  The
+        # actual inpainting below still receives each frame's individual mask.
+        area_mask = np.maximum.reduce(normalized_masks)
+        H_ori, W_ori = area_mask.shape
         H_ori = int(H_ori + 0.5)
         W_ori = int(W_ori + 0.5)
         # 确定去字幕的垂直高度部分
         split_h = int(W_ori * 3 / 16)
-        inpaint_area = get_inpaint_area_by_mask(W_ori, H_ori, split_h, mask, multiple=8)
+        inpaint_area = get_inpaint_area_by_mask(W_ori, H_ori, split_h, area_mask, multiple=8)
         # 初始化帧存储变量
         # 高分辨率帧存储列表
         frames_hr = [f.copy() for f in input_frames]
@@ -387,17 +429,18 @@ class PropainterInpaint:
         # 读取并缩放帧
         for j in range(len(frames_hr)):
             image = frames_hr[j]
+            mask = normalized_masks[j]
             # 对每个去除部分进行切割和缩放
             for k in range(len(inpaint_area)):
                 image_crop = image[inpaint_area[k][0]:inpaint_area[k][1], inpaint_area[k][2]:inpaint_area[k][3], :]  # 切割
-                mask_crop = mask[inpaint_area[k][0]:inpaint_area[k][1], inpaint_area[k][2]:inpaint_area[k][3], :]  # 切割
+                mask_crop = mask[inpaint_area[k][0]:inpaint_area[k][1], inpaint_area[k][2]:inpaint_area[k][3]]  # 切割
                 frames_scaled[k].append(image_crop)  # 将缩放后的帧添加到对应列表
                 masks_scaled[k].append(mask_crop)  # 将缩放后的遮罩添加到对应列表
 
         # 处理每一个去除部分
         for k in range(len(inpaint_area)):
             # 调用inpaint函数进行处理
-            comps[k] = self.inpaint(frames_scaled[k], masks_scaled[k][0])
+            comps[k] = self.inpaint(frames_scaled[k], masks_scaled[k])
             del frames_scaled[k], masks_scaled[k]
             gc.collect()
 

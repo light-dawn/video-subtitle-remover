@@ -20,7 +20,11 @@ from backend.inpaint.sttn_det_inpaint import STTNDetInpaint
 from backend.inpaint.lama_inpaint import LamaInpaint
 from backend.inpaint.opencv_inpaint import OpenCVInpaint
 from backend.inpaint.propainter_inpaint import PropainterInpaint
-from backend.tools.inpaint_tools import create_mask, batch_generator, expand_frame_ranges
+from backend.tools.inpaint_tools import (create_mask, create_polygon_mask,
+                                         smooth_masks_temporally, batch_generator,
+                                         expand_frame_ranges,
+                                         build_transition_blend_weights,
+                                         blend_frames_in_mask)
 from backend.tools.model_config import ModelConfig
 from backend.tools.ffmpeg_cli import FFmpegCLI
 from backend.tools.subtitle_detect import SubtitleDetect
@@ -168,9 +172,15 @@ class SubtitleRemover:
     def propainter_mode(self, tbar):
         sub_detector = SubtitleDetect(self.video_path, self.sub_areas)
         sub_list = sub_detector.find_subtitle_frame_no(sub_remover=self)
+        frame_polygons = sub_detector.frame_polygons
         if len(sub_list) == 0:
             raise Exception(tr['Main']['NoSubtitleDetected'].format(self.video_path))
         continuous_frame_no_list = sub_detector.find_continuous_ranges_with_same_mask(sub_list)
+        transition_blend_weights = build_transition_blend_weights(
+            continuous_frame_no_list,
+            config.subtitleTimelineBackwardFrameCount.value,
+            config.subtitleTimelineForwardFrameCount.value,
+        )
         # Detection can miss a subtitle's first/last few frames (especially
         # during fades).  Apply the configured temporal guard band before
         # ProPainter, just as the other detection-based inpainting path does.
@@ -200,8 +210,11 @@ class SubtitleRemover:
             if mask_frame_no is None:
                 continue
             mask_boxes = sub_list[mask_frame_no]
+            mask_polygons = frame_polygons.get(mask_frame_no, [])
             for frame_no in range(start_frame_no, end_frame_no + 1):
                 sub_list.setdefault(frame_no, mask_boxes)
+                if mask_polygons:
+                    frame_polygons.setdefault(frame_no, mask_polygons)
         del sub_detector
         gc.collect()        
         device = self.hardware_accelerator.device if self.hardware_accelerator.has_cuda() else torch.device("cpu")
@@ -255,6 +268,10 @@ class SubtitleRemover:
                             inner_index += 1
                             single_mask = create_mask(self.mask_size, sub_list[index])
                             inpainted_frame = self.lama_inpaint.inpaint(frame, single_mask)
+                            blend_weight = transition_blend_weights.get(index, 1.0)
+                            inpainted_frame = blend_frames_in_mask(
+                                frame, inpainted_frame, single_mask, blend_weight
+                            )
                             self.video_writer.write(inpainted_frame)
                             # self.append_output(f'write frame: {start_frame_no + inner_index} with mask {sub_list[start_frame_no]}')
                             self.update_progress(tbar, increment=1)
@@ -262,23 +279,44 @@ class SubtitleRemover:
                         else:
                             # 将读取的视频帧分批处理
                             # 1. 获取当前批次使用的mask
-                            mask = create_mask(self.mask_size, sub_list[start_frame_no])
+                            frame_masks = []
+                            for frame_no in range(start_frame_no, end_frame_no + 1):
+                                polygons = frame_polygons.get(frame_no)
+                                if polygons:
+                                    frame_masks.append(create_polygon_mask(self.mask_size, polygons))
+                                else:
+                                    frame_masks.append(create_mask(self.mask_size, sub_list[frame_no]))
+                            frame_masks = smooth_masks_temporally(frame_masks, radius=2)
+                            mask_offset = 0
                             for batch in batch_generator(temp_frames, config.propainterMaxLoadNum.value):
+                                batch_masks = frame_masks[mask_offset:mask_offset + len(batch)]
+                                mask_offset += len(batch)
                                 # 2. 调用批推理
                                 if len(batch) == 1:
-                                    single_mask = create_mask(self.mask_size, sub_list[start_frame_no])
-                                    inpainted_frame = self.lama_inpaint.inpaint(frame, single_mask)
+                                    single_mask = batch_masks[0]
+                                    inpainted_frame = self.lama_inpaint.inpaint(batch[0], single_mask)
+                                    output_frame_no = start_frame_no + inner_index
+                                    blend_weight = transition_blend_weights.get(output_frame_no, 1.0)
+                                    inpainted_frame = blend_frames_in_mask(
+                                        batch[0], inpainted_frame, single_mask, blend_weight
+                                    )
                                     self.video_writer.write(inpainted_frame)
                                     # self.append_output(f'write frame: {start_frame_no + inner_index} with mask {sub_list[start_frame_no]}')
                                     inner_index += 1
                                     self.update_progress(tbar, increment=1)
                                 elif len(batch) > 1:
-                                    inpainted_frames = propainter_inpaint(batch, mask)
+                                    inpainted_frames = propainter_inpaint(batch, batch_masks)
                                     for i, inpainted_frame in enumerate(inpainted_frames):
+                                        output_frame_no = start_frame_no + inner_index
+                                        blend_weight = transition_blend_weights.get(output_frame_no, 1.0)
+                                        inpainted_frame = blend_frames_in_mask(
+                                            batch[i], inpainted_frame,
+                                            batch_masks[i], blend_weight,
+                                        )
                                         self.video_writer.write(inpainted_frame)
                                         # self.append_output(f'write frame: {start_frame_no + inner_index} with mask {sub_list[index]}')
                                         inner_index += 1
-                                        self.update_preview_with_comp(np.clip(batch[i]+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame)
+                                        self.update_preview_with_comp(np.clip(batch[i]+batch_masks[i][:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame)
                                 self.update_progress(tbar, increment=len(batch))
         reader.stop()
 

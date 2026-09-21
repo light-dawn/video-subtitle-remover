@@ -46,6 +46,117 @@ def create_mask(size, coords_list):
                           (x2, y2), (255, 255, 255), thickness=-1)
     return mask
 
+
+def create_polygon_mask(size, polygons):
+    """Rasterize OCR text quadrilaterals into a binary mask.
+
+    PaddleOCR supplies a polygon around each text line.  Filling that polygon
+    preserves more surrounding pixels than converting it to an axis-aligned
+    detection box.  ProPainter applies its own edge dilation later, so the
+    polygon must not be expanded here as well.
+    """
+    mask = np.zeros(size, dtype="uint8")
+    if not polygons:
+        return mask
+    valid_polygons = []
+    for polygon in polygons:
+        points = np.asarray(polygon, dtype=np.int32)
+        if points.ndim == 2 and points.shape[0] >= 3 and points.shape[1] == 2:
+            valid_polygons.append(points)
+    if not valid_polygons:
+        return mask
+    cv2.fillPoly(mask, valid_polygons, 255)
+    return mask
+
+
+def smooth_masks_temporally(masks, radius=2):
+    """Suppress one-frame mask jitter with a centered temporal majority vote.
+
+    A triangular kernel gives the current frame the largest weight while still
+    requiring support from a neighboring frame before a pixel is included.
+    Calling this per subtitle interval prevents masks from bleeding across text
+    or scene changes.
+    """
+    if not masks:
+        return []
+    if radius < 1 or len(masks) == 1:
+        return [mask.copy() for mask in masks]
+
+    expected_shape = masks[0].shape
+    if any(not isinstance(mask, np.ndarray) or mask.shape != expected_shape for mask in masks):
+        raise ValueError("All masks must be numpy arrays with the same shape")
+
+    smoothed_masks = []
+    for frame_index in range(len(masks)):
+        first = max(0, frame_index - radius)
+        last = min(len(masks), frame_index + radius + 1)
+        weighted_votes = np.zeros(expected_shape, dtype=np.uint16)
+        total_weight = 0
+        for neighbor_index in range(first, last):
+            weight = radius + 1 - abs(neighbor_index - frame_index)
+            weighted_votes += (masks[neighbor_index] > 0).astype(np.uint16) * weight
+            total_weight += weight
+        # A strict majority removes isolated one-frame detections, including
+        # at the beginning and end of an interval.
+        smoothed_masks.append(
+            (weighted_votes > total_weight // 2).astype(np.uint8) * 255
+        )
+    return smoothed_masks
+
+
+def build_transition_blend_weights(frame_ranges, backward_frame_count, forward_frame_count):
+    """Build repair blend weights for subtitle/no-subtitle boundaries.
+
+    Detected subtitle frames always use the fully repaired image.  Only the
+    temporal guard frames outside each detected range are feathered.  Taking
+    the maximum weight also keeps adjacent subtitle ranges at full strength.
+    """
+    weights = {}
+    for start, end in frame_ranges:
+        for frame_no in range(start, end + 1):
+            weights[frame_no] = 1.0
+
+        if backward_frame_count > 0:
+            denominator = backward_frame_count + 1
+            for distance in range(1, backward_frame_count + 1):
+                frame_no = start - distance
+                if frame_no < 1:
+                    continue
+                weight = (backward_frame_count - distance + 1) / denominator
+                weights[frame_no] = max(weights.get(frame_no, 0.0), weight)
+
+        if forward_frame_count > 0:
+            denominator = forward_frame_count + 1
+            for distance in range(1, forward_frame_count + 1):
+                frame_no = end + distance
+                weight = (forward_frame_count - distance + 1) / denominator
+                weights[frame_no] = max(weights.get(frame_no, 0.0), weight)
+    return weights
+
+
+def blend_frames_in_mask(original_frame, repaired_frame, mask, weight=1.0):
+    """Blend a repaired frame into the original only where the OCR mask is set."""
+    if original_frame.shape != repaired_frame.shape:
+        raise ValueError("Original and repaired frames must have the same shape")
+    if mask.ndim == 3 and mask.shape[2] == 1:
+        mask = mask[:, :, 0]
+    if mask.ndim != 2 or mask.shape != original_frame.shape[:2]:
+        raise ValueError("Mask shape must match the frame dimensions")
+
+    weight = float(np.clip(weight, 0.0, 1.0))
+    output = original_frame.copy()
+    selected = mask > 0
+    if not np.any(selected) or weight == 0.0:
+        return output
+    if weight == 1.0:
+        output[selected] = repaired_frame[selected]
+        return output
+
+    blended = cv2.addWeighted(original_frame, 1.0 - weight,
+                              repaired_frame, weight, 0)
+    output[selected] = blended[selected]
+    return output
+
 def get_inpaint_area_by_mask(W, H, h, mask, multiple=1):
     """
     获取字幕去除区域，根据mask来确定需要填补的区域和高度，

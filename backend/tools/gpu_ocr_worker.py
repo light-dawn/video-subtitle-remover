@@ -36,14 +36,16 @@ def in_selected_sections(frame_no, sections):
 def filter_regions(polygons, sub_areas):
     coordinates = get_coordinates(polygons)
     if not sub_areas:
-        return coordinates
-    matches = []
-    for xmin, xmax, ymin, ymax in coordinates:
+        return coordinates, polygons
+    boxes = []
+    matched_polygons = []
+    for polygon, (xmin, xmax, ymin, ymax) in zip(polygons, coordinates):
         for s_ymin, s_ymax, s_xmin, s_xmax in sub_areas:
             if s_xmin <= xmin and xmax <= s_xmax and s_ymin <= ymin and ymax <= s_ymax:
-                matches.append((xmin, xmax, ymin, ymax))
+                boxes.append((xmin, xmax, ymin, ymax))
+                matched_polygons.append(polygon)
                 break
-    return matches
+    return boxes, matched_polygons
 
 
 def main():
@@ -77,12 +79,18 @@ def main():
             if (in_selected_sections(current_frame_no - 1, ab_sections)
                     and ((current_frame_no - 1) % args.sample_step == 0 or args.sample_step <= 1)):
                 boxes = []
+                polygons_for_frame = []
                 for result in detector.predict(frame):
                     polygons = result.get("dt_polys")
                     if polygons is not None and len(polygons):
-                        boxes.extend(filter_regions(polygons.tolist(), sub_areas))
+                        result_boxes, result_polygons = filter_regions(polygons.tolist(), sub_areas)
+                        boxes.extend(result_boxes)
+                        polygons_for_frame.extend(result_polygons)
                 if boxes:
-                    sampled_results[current_frame_no] = boxes
+                    sampled_results[current_frame_no] = {
+                        "boxes": boxes,
+                        "polygons": polygons_for_frame,
+                    }
             # Reducing IPC traffic is important for long videos while keeping
             # the UI responsive.
             if current_frame_no % 3 == 0 or current_frame_no == frame_count:

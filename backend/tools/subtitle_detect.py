@@ -42,6 +42,9 @@ class SubtitleDetect:
     def __init__(self, video_path, sub_areas=[]):
         self.video_path = video_path
         self.sub_areas = sub_areas
+        # GPU OCR additionally provides the original text quadrilaterals. They
+        # are kept separate from boxes because range grouping still uses boxes.
+        self.frame_polygons = {}
         self._init_sample_step()
 
     def _init_sample_step(self):
@@ -151,7 +154,15 @@ class SubtitleDetect:
                 if message["kind"] == "progress":
                     self._set_detection_progress(sub_remover, message["current"], message["total"])
                 elif message["kind"] == "result":
-                    sampled_results = {int(frame_no): boxes for frame_no, boxes in message["sampled_results"].items()}
+                    raw_results = message["sampled_results"]
+                    self.frame_polygons = {
+                        int(frame_no): value.get("polygons", [])
+                        for frame_no, value in raw_results.items()
+                    }
+                    sampled_results = {
+                        int(frame_no): value["boxes"]
+                        for frame_no, value in raw_results.items()
+                    }
                 elif message["kind"] == "error":
                     diagnostics.append(message["message"])
         finally:
