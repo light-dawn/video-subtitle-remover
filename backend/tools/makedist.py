@@ -54,7 +54,7 @@ def main():
         save_path=SAVE_PATH,
         icon=ICON_PATH,
         hidden_terminal=False,
-        requirements_file="./requirements.txt",
+        requirements_file="./requirements-qpt.txt",
         sub_modules=sub_modules,
     )
 

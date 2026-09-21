@@ -1,0 +1,48 @@
+[project]
+name = "video-subtitle-remover"
+version = "1.4.0"
+description = "Local AI removal of hard-coded video subtitles and text watermarks"
+readme = "README_en.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "av==17.0.0",
+    "darkdetect",
+    "einops==0.8.1",
+    "filesplit==3.0.2",
+    "je-showinfilemanager==1.1.6a4",
+    "matplotlib",
+    "numpy==2.2.5",
+    "onnxruntime-gpu==1.22.0; sys_platform == 'win32'",
+    "opencv-python==4.11.0.86",
+    "paddleocr==3.4.0",
+    "paddlepaddle==3.0.0",
+    "Pillow",
+    "pyside6-fluent-widgets==1.7.7",
+    "requests",
+    "scikit-image==0.25.2",
+    "scipy",
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+    "tqdm==4.67.1",
+]
+
+[dependency-groups]
+build = [
+    "QPT==1.0b8",
+    "setuptools",
+]
+
+[tool.uv]
+# This repository contains application code rather than an installable Python
+# distribution. Dependencies are synced into a named, hardware-specific venv.
+package = false
+default-groups = []
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

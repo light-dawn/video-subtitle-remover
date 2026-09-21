@@ -1,17 +1,35 @@
+import json
+import os
+import subprocess
 import sys
+from collections import deque
 from functools import cached_property
+from pathlib import Path
+
+# PaddleOCR's CPU inference backend otherwise inherits all logical cores on
+# Windows.  Its worker process can create thousands of threads and appear to
+# hang on the first frame.  These values are read when Paddle is imported.
+for _thread_env in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_thread_env, "4")
+# Avoid a host-availability probe on every first OCR use.  Models are supplied
+# from ModelConfig's local model directory.
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
 import cv2
 from tqdm import tqdm
 
 from .model_config import ModelConfig
-from .hardware_accelerator import HardwareAccelerator
 from .common_tools import get_readable_path
 from .ocr import get_coordinates
 from backend.config import config, tr
 from backend.scenedetect import scene_detect
 from backend.scenedetect.detectors import ContentDetector
 from backend.tools.inpaint_tools import is_frame_number_in_ab_sections
+
+# Subtitle scanning is also invoked from the GUI worker thread.  Keep tqdm
+# output out of the packaged application's invalid console handle.
+TQDM_OUTPUT = open(os.devnull, "w", encoding="utf-8")
+GPU_WORKER_MESSAGE_PREFIX = "__VSR_GPU_OCR__"
 
 class SubtitleDetect:
     """
@@ -41,16 +59,23 @@ class SubtitleDetect:
     @cached_property
     def text_detector(self):
         import paddle
+        paddle.set_flags({"FLAGS_paddle_num_threads": 4})
         paddle.disable_signal_handler()
         from paddleocr import TextDetection
-        hardware_accelerator = HardwareAccelerator.instance()
-        onnx_providers = hardware_accelerator.onnx_providers
         model_config = ModelConfig()
+        # The Windows RTX 50-series Paddle GPU wheel exposes CUDA through
+        # Paddle itself.  Keep a CPU fallback so this source tree remains
+        # runnable in a CPU-only environment as well.
+        ocr_device = "gpu" if paddle.is_compiled_with_cuda() else "cpu"
         return TextDetection(
             model_name=model_config.DET_MODEL_NAME,
             model_dir=model_config.DET_MODEL_DIR,
-            device="cpu",
-            enable_hpi=len(onnx_providers) > 0,
+            device=ocr_device,
+            # PaddleX HPI is not supported in a native Windows installation.
+            # CUDAExecutionProvider belongs to ONNX Runtime and is still used
+            # elsewhere; it must not force PaddleOCR to require its separate
+            # HPI plugin (which fails predictor creation on Windows).
+            enable_hpi=False,
         )
 
     def detect_subtitle(self, img):
@@ -81,14 +106,81 @@ class SubtitleDetect:
                             break
         return temp_list
 
+    @staticmethod
+    def _gpu_ocr_python():
+        project_root = Path(__file__).resolve().parents[2]
+        python_path = project_root / ".venv-ocr-gpu" / "Scripts" / "python.exe"
+        return python_path if python_path.is_file() else None
+
+    @staticmethod
+    def _set_detection_progress(sub_remover, current_frame_no, frame_count):
+        if not sub_remover:
+            return
+        sub_remover.progress_total = int(50 * float(current_frame_no) / float(frame_count))
+        sub_remover.notify_progress_listeners()
+
+    def _find_subtitle_frame_no_gpu(self, sub_remover, python_path):
+        model_config = ModelConfig()
+        project_root = Path(__file__).resolve().parents[2]
+        command = [
+            str(python_path), "-m", "backend.tools.gpu_ocr_worker",
+            "--video", get_readable_path(self.video_path),
+            "--model-name", model_config.DET_MODEL_NAME,
+            "--model-dir", model_config.DET_MODEL_DIR,
+            "--sub-areas", json.dumps(self.sub_areas),
+            # GPU OCR is fast enough to inspect every frame.  Sampling every
+            # third frame can miss a short subtitle or its fade-in/fade-out.
+            "--sample-step", "1",
+            "--ab-sections", json.dumps(sub_remover.ab_sections if sub_remover else None),
+        ]
+        if sub_remover:
+            sub_remover.progress_base = 0
+            sub_remover.progress_span = 50
+            sub_remover.append_output("[GPU OCR] " + tr['Main']['ProcessingStartFindingSubtitles'])
+        process = subprocess.Popen(command, cwd=project_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, encoding="utf-8", errors="replace", bufsize=1)
+        diagnostics = deque(maxlen=20)
+        sampled_results = None
+        try:
+            for line in process.stdout:
+                line = line.rstrip()
+                if not line.startswith(GPU_WORKER_MESSAGE_PREFIX):
+                    diagnostics.append(line)
+                    continue
+                message = json.loads(line[len(GPU_WORKER_MESSAGE_PREFIX):])
+                if message["kind"] == "progress":
+                    self._set_detection_progress(sub_remover, message["current"], message["total"])
+                elif message["kind"] == "result":
+                    sampled_results = {int(frame_no): boxes for frame_no, boxes in message["sampled_results"].items()}
+                elif message["kind"] == "error":
+                    diagnostics.append(message["message"])
+        finally:
+            if process.stdout:
+                process.stdout.close()
+        return_code = process.wait()
+        if return_code or sampled_results is None:
+            details = "\n".join(diagnostics)
+            raise RuntimeError(f"GPU OCR worker failed (exit code {return_code}). {details}")
+        return sampled_results
+
     def find_subtitle_frame_no(self, sub_remover=None):
+        gpu_python = self._gpu_ocr_python()
+        if config.hardwareAcceleration.value and gpu_python:
+            sampled_results = self._find_subtitle_frame_no_gpu(sub_remover, gpu_python)
+            return self._finalize_sampled_results(sampled_results, sub_remover)
+
         video_cap = cv2.VideoCapture(get_readable_path(self.video_path))
         frame_count = video_cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        tbar = tqdm(total=int(frame_count), unit='frame', position=0, file=sys.__stdout__, desc='Subtitle Finding')
+        tbar = tqdm(total=int(frame_count), unit='frame', position=0, file=TQDM_OUTPUT, desc='Subtitle Finding')
         current_frame_no = 0
         # 阶段1：采样检测，仅对每隔 sample_step 帧执行 OCR
         sampled_results = {}  # frame_no -> temp_list
         if sub_remover:
+            # OCR scanning is the first half of a detection-based run.  This
+            # must notify the GUI through its process queue; assigning the
+            # attribute alone only changes the child process's memory.
+            sub_remover.progress_base = 0
+            sub_remover.progress_span = 50
             sub_remover.append_output(tr['Main']['ProcessingStartFindingSubtitles'])
         while video_cap.isOpened():
             ret, frame = video_cap.read()
@@ -107,8 +199,11 @@ class SubtitleDetect:
                     sampled_results[current_frame_no] = temp_list
             tbar.update(1)
             if sub_remover:
-                sub_remover.progress_total = (100 * float(current_frame_no) / float(frame_count)) // 2
+                self._set_detection_progress(sub_remover, current_frame_no, frame_count)
         video_cap.release()
+        return self._finalize_sampled_results(sampled_results, sub_remover)
+
+    def _finalize_sampled_results(self, sampled_results, sub_remover):
         # 阶段2：插值填充 — 两个采样帧之间都有字幕时，中间帧也标记为有字幕
         subtitle_frame_no_box_dict = {}
         detected_nos = sorted(sampled_results.keys())
@@ -124,6 +219,12 @@ class SubtitleDetect:
             subtitle_frame_no_box_dict[detected_nos[-1]] = sampled_results[detected_nos[-1]]
         subtitle_frame_no_box_dict = self.unify_regions(subtitle_frame_no_box_dict)
         if sub_remover:
+            sub_remover.progress_total = 50
+            sub_remover.notify_progress_listeners()
+            # The inpainting tqdm begins at zero, so map it to the remaining
+            # half rather than making the GUI progress jump backwards.
+            sub_remover.progress_base = 50
+            sub_remover.progress_span = 50
             sub_remover.append_output(tr['Main']['FinishedFindingSubtitles'])
         new_subtitle_frame_no_box_dict = dict()
         for key in subtitle_frame_no_box_dict.keys():

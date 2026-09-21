@@ -376,10 +376,15 @@ class HomeInterface(QWidget):
                             # 更新任务状态为已完成
                             task_obj = self.task_list_component.get_task(self.current_processing_task_index)
                             if process.exitcode == 0 and task_obj and task_obj.status == TaskStatus.PROCESSING:
-                                self.progress_signal.emit(100, True)
                                 # 任务完成, 更新输出路径为只读
                                 task_obj.output_path = output_path
                                 self.task_status_signal.emit(self.current_processing_task_index, TaskStatus.COMPLETED)
+                                # Queue the status change before the final
+                                # progress signal.  processing_finished()
+                                # checks for pending tasks, so doing this in
+                                # the opposite order leaves the UI stuck at
+                                # 100% even though the file was saved.
+                                self.progress_signal.emit(100, True)
                             else:
                                 self.task_status_signal.emit(self.current_processing_task_index, TaskStatus.FAILED)
 
@@ -685,4 +690,3 @@ class HomeInterface(QWidget):
         except Exception as e:
             print(f"Error during close window:", e)
         super().closeEvent(event)
-    

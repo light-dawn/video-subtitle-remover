@@ -31,6 +31,11 @@ import time
 from tqdm import tqdm
 import numpy as np
 
+# The GUI starts processing on a worker thread.  Packaged Windows applications
+# do not always have a valid console handle, so tqdm must not write to
+# sys.__stdout__ there.  Progress is rendered by the GUI itself.
+TQDM_OUTPUT = open(os.devnull, "w", encoding="utf-8")
+
 class SubtitleRemover:
     def __init__(self, vd_path, gui_mode=False):
         # 线程锁
@@ -78,6 +83,10 @@ class SubtitleRemover:
         # 总处理进度
         self.progress_total = 0
         self.progress_remover = 0
+        # A processing run may have a detection phase before inpainting.  The
+        # current tqdm is mapped into this portion of the GUI's total progress.
+        self.progress_base = 0
+        self.progress_span = 100
         self.isFinished = False
         # 是否将原音频嵌入到去除字幕后的视频
         self.is_successful_merged = False
@@ -110,7 +119,7 @@ class SubtitleRemover:
         tbar.update(increment)
         current_percentage = (tbar.n / tbar.total) * 100
         self.progress_remover = int(current_percentage)
-        self.progress_total = self.progress_remover
+        self.progress_total = int(self.progress_base + current_percentage * self.progress_span / 100)
         self.notify_progress_listeners()
 
     def append_output(self, *args):
@@ -162,9 +171,37 @@ class SubtitleRemover:
         if len(sub_list) == 0:
             raise Exception(tr['Main']['NoSubtitleDetected'].format(self.video_path))
         continuous_frame_no_list = sub_detector.find_continuous_ranges_with_same_mask(sub_list)
+        # Detection can miss a subtitle's first/last few frames (especially
+        # during fades).  Apply the configured temporal guard band before
+        # ProPainter, just as the other detection-based inpainting path does.
+        continuous_frame_no_list = expand_frame_ranges(
+            continuous_frame_no_list,
+            config.subtitleTimelineBackwardFrameCount.value,
+            config.subtitleTimelineForwardFrameCount.value,
+        )
         scene_div_points = sub_detector.get_scene_div_frame_no(self.video_path)
         continuous_frame_no_list = sub_detector.split_range_by_scene(continuous_frame_no_list,
                                                                           scene_div_points)
+        # Never let the guard band extend past EOF.  Otherwise the inner
+        # prefetch loop consumes its end-of-stream sentinel and the outer loop
+        # waits forever after the progress bar has reached 100%.
+        continuous_frame_no_list = [
+            (max(1, start_frame_no), min(end_frame_no, self.frame_count))
+            for start_frame_no, end_frame_no in continuous_frame_no_list
+        ]
+        # The expanded boundary frames have no OCR box of their own.  Reuse the
+        # nearest detected mask so they are actually sent to ProPainter rather
+        # than copied through unchanged.
+        for start_frame_no, end_frame_no in continuous_frame_no_list:
+            mask_frame_no = next(
+                (frame_no for frame_no in range(start_frame_no, end_frame_no + 1) if frame_no in sub_list),
+                None,
+            )
+            if mask_frame_no is None:
+                continue
+            mask_boxes = sub_list[mask_frame_no]
+            for frame_no in range(start_frame_no, end_frame_no + 1):
+                sub_list.setdefault(frame_no, mask_boxes)
         del sub_detector
         gc.collect()        
         device = self.hardware_accelerator.device if self.hardware_accelerator.has_cuda() else torch.device("cpu")
@@ -243,6 +280,7 @@ class SubtitleRemover:
                                         inner_index += 1
                                         self.update_preview_with_comp(np.clip(batch[i]+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame)
                                 self.update_progress(tbar, increment=len(batch))
+        reader.stop()
 
     def sttn_auto_mode(self, tbar):
         """
@@ -348,7 +386,9 @@ class SubtitleRemover:
         os.makedirs(os.path.dirname(self.video_out_path), exist_ok=True)
         # 重置进度条
         self.progress_total = 0
-        tbar = tqdm(total=int(self.frame_count), unit='frame', position=0, file=sys.__stdout__,
+        self.progress_base = 0
+        self.progress_span = 100
+        tbar = tqdm(total=int(self.frame_count), unit='frame', position=0, file=TQDM_OUTPUT,
                     desc='Subtitle Removing')
         if self.is_picture:
             original_frame = read_image(self.video_path)
@@ -394,6 +434,10 @@ class SubtitleRemover:
         self.append_output(tr['Main']['ProcessingTime'].format(round(time.time() - start_time)))
         self.isFinished = True
         self.progress_total = 100
+        # The GUI runs this object in a child process.  Its final state must be
+        # sent through the progress callback; otherwise the task remains
+        # visually stuck at 100% until the application is restarted.
+        self.notify_progress_listeners()
         if os.path.exists(self.video_temp_file.name):
             try:
                 os.remove(self.video_temp_file.name)

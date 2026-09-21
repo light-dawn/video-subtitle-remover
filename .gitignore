@@ -286,6 +286,7 @@ celerybeat.pid
 # .env
 .env/
 .venv/
+.venv-*/
 env/
 venv/
 ENV/
@@ -375,3 +376,5 @@ test*_no_sub*.mp4
 /backend/tools/train/release_model/
 inference.onnx
 /config/config.json
+/VSR-v1.1.1-cuda12.8*/
+/requirements-qpt.txt
